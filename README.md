@@ -27,5 +27,7 @@ An efficient, lightweight CLI tool for Minecraft SchoolRP players to track In-Ch
 Distributed under the **MIT License**. See the header in `Schoolrptime.py` for details.
 
 ---
+(Note: The Calibration .json should not be deleted, that is what makes the script remember the time!)
+
 *Created with ❤️ for the SchoolRP Community.*
 
