@@ -1,58 +1,38 @@
-"""
-SchoolRP Time Calculator
-------------------------
-A comprehensive utility for Minecraft SchoolRP players to track In-Character (IC) time, 
-days of the week, and school schedules, synchronized with real-world (OOC) time.
-
-Features:
-- Accurate conversion (Default: 15s OOC = 1 min IC).
-- Day of Week tracking (Monday-Sunday).
-- Official SchoolRP Schedule display.
-- Configurable time speed for events/weekends.
-
-Author: Kennedy
-License: MIT
-
-Copyright (c) 2026 Kennedy
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-"""
-
 import os
 import json
-import sys
-from datetime import datetime
-from typing import Optional, Tuple, List, Dict, Union
+import time
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, Dict, Set
 
-# ==========================================
-# CONFIGURATION CONSTANTS
-# ==========================================
-# Default Time Speeds (Real Seconds per IC Minute)
-# Standard: 1 real min = 4 IC mins => 60 / 4 = 15.0 seconds
-# Weekend:  1 real min = 6 IC mins => 60 / 6 = 10.0 seconds
-SPEED_STANDARD = 15.0
-SPEED_WEEKEND = 10.0
+# Audio Alert Setup
+try:
+    import winsound
 
+    def play_beep():
+        winsound.Beep(1000, 500)
+except ImportError:
+
+    def play_beep():
+        print("\a", end="", flush=True)
+
+
+# Constants - Hardcoded so they can't break
+SPEED_STANDARD = 15.0  # Mon-Fri
+SPEED_WEEKEND = 10.0  # Sat-Sun
+ALERT_LEAD_IC = 5  # Beep 5 IC mins before class
 CALIBRATION_FILE = "calibration.json"
+DAYS_OF_WEEK = [
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+]
+IC_MIN_PER_DAY = 1440
+ALERT_EPSILON = 0.5  # Tolerance for float comparison in alerts
 
-DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-IC_MIN_PER_DAY = 24 * 60
-
-# Official SchoolRP Weekday Schedule (IC Time)
 SCHOOL_SCHEDULE: Dict[str, str] = {
     "Start of Day": "07:30",
     "Breakfast": "08:00",
@@ -62,321 +42,221 @@ SCHOOL_SCHEDULE: Dict[str, str] = {
     "Period 3": "10:55",
     "Lunch": "12:35",
     "Period 4": "13:20",
-    "End of Day": "15:00"
+    "End of Day": "15:00",
 }
 
-def clear_screen():
-    """Clears the console screen in a cross-platform way."""
-    os.system('cls' if os.name == 'nt' else 'clear')
 
-def time_to_min(time_str: str) -> Optional[int]:
-    """
-    Converts HH:MM string to total minutes from midnight.
-    Returns None if format is invalid.
-    """
-    try:
-        if ":" not in time_str:
-            return None
-        h, m = map(int, time_str.split(':'))
-        if not (0 <= h < 24 and 0 <= m < 60):
-            return None
-        return h * 60 + m
-    except (ValueError, AttributeError):
+def match_day(input_str: str) -> Optional[int]:
+    """Match user input to a day index, handling abbreviations unambiguously."""
+    if not input_str:
         return None
-
-def min_to_time(total_min: float) -> str:
-    """Converts total minutes from midnight to HH:MM format."""
-    total_min %= IC_MIN_PER_DAY
-    h = int(total_min // 60)
-    m = int(total_min % 60)
-    return f"{h:02d}:{m:02d}"
-
-def get_day_index(day_input: str) -> Optional[int]:
-    """
-    Tries to parse a day index (0-6) from a string input (name, abbreviation, or number).
-    Returns None if invalid.
-    """
-    day_input = day_input.strip().capitalize()
-    
-    # Check full names
-    if day_input in DAYS_OF_WEEK:
-        return DAYS_OF_WEEK.index(day_input)
-    
-    # Check abbreviations (e.g., "Mon", "Thu")
+    # Exact match first
     for i, d in enumerate(DAYS_OF_WEEK):
-        if d.startswith(day_input):
+        if d.lower() == input_str.lower():
             return i
-            
-    # Check numbers 1-7 (1=Monday)
-    try:
-        val = int(day_input)
-        if 1 <= val <= 7:
-            return val - 1
-    except ValueError:
-        pass
-        
+    # Case-insensitive prefix match — require at least 3 chars to disambiguate Sat/Sun
+    if len(input_str) < 3:
+        return None
+    for i, d in enumerate(DAYS_OF_WEEK):
+        if d.lower().startswith(input_str.lower()):
+            return i
     return None
 
+
 class SchoolRPTimeBoard:
-    """
-    Manages the calibration, state persistence, and time conversion logic for SchoolRP.
-    """
-    
     def __init__(self):
-        # Format: day_index * 1440 + minutes_into_day
         self.cal_ic_total_min: Optional[float] = None
         self.cal_real_dt: Optional[datetime] = None
-        self.time_speed: float = SPEED_STANDARD
+        self.played_alerts: Set[str] = set()
+        self.last_alert_day: Optional[str] = None
+        self.current_speed: float = SPEED_STANDARD
         self.load_calibration()
 
-    def load_calibration(self) -> bool:
-        """Loads calibration data from a local JSON file."""
-        if not os.path.exists(CALIBRATION_FILE):
-            return False
-            
-        try:
-            with open(CALIBRATION_FILE, 'r') as f:
-                data = json.load(f)
-                
-                # Migration Logic: 
-                # If old format (ic_min present, ic_total_min missing), convert to Monday (0) + min
-                if 'ic_min' in data and 'ic_total_min' not in data:
-                    self.cal_ic_total_min = float(data['ic_min']) # Default to Monday
-                else:
-                    self.cal_ic_total_min = data.get('ic_total_min')
-                    
-                if data.get('real_dt'):
-                    self.cal_real_dt = datetime.fromisoformat(data['real_dt'])
-                self.time_speed = data.get('time_speed', SPEED_STANDARD)
-                return True
-        except (json.JSONDecodeError, KeyError, ValueError):
-            return False
+    def load_calibration(self):
+        if os.path.exists(CALIBRATION_FILE):
+            try:
+                with open(CALIBRATION_FILE, "r") as f:
+                    data = json.load(f)
+                    self.cal_ic_total_min = data.get("ic_total_min")
+                    if data.get("real_dt"):
+                        self.cal_real_dt = datetime.fromisoformat(data["real_dt"])
+            except (json.JSONDecodeError, ValueError, OSError, KeyError):
+                pass
 
-    def save_calibration(self, ic_time_str: Optional[str] = None, ic_day_idx: Optional[int] = None) -> bool:
-        """
-        Saves current state to JSON.
-        If ic_time_str and ic_day_idx are provided, performs a fresh Sync.
-        Otherwise, just saves the current configuration (speed).
-        """
-        # If performing a full sync
-        if ic_time_str and ic_day_idx is not None:
-            day_min = time_to_min(ic_time_str)
-            if day_min is None:
+    def save_calibration(self, ic_time_str: str, ic_day_idx: int) -> bool:
+        try:
+            h, m = map(int, ic_time_str.split(":"))
+            if not (0 <= h <= 23 and 0 <= m <= 59):
                 return False
-                
+            day_min = h * 60 + m
             self.cal_ic_total_min = (ic_day_idx * IC_MIN_PER_DAY) + day_min
             self.cal_real_dt = datetime.now()
-        
-        # Prepare data
-        data = {
-            'ic_total_min': self.cal_ic_total_min,
-            'real_dt': self.cal_real_dt.isoformat() if self.cal_real_dt else None,
-            'time_speed': self.time_speed
-        }
-        
-        try:
-            with open(CALIBRATION_FILE, 'w') as f:
-                json.dump(data, f, indent=4)
+            with open(CALIBRATION_FILE, "w") as f:
+                json.dump(
+                    {
+                        "ic_total_min": self.cal_ic_total_min,
+                        "real_dt": self.cal_real_dt.isoformat(),
+                    },
+                    f,
+                )
+            self.played_alerts.clear()
+            self.last_alert_day = None
             return True
-        except IOError:
+        except (ValueError, OSError):
             return False
 
-    def get_estimated_ic_now(self) -> Tuple[Optional[str], Optional[str], Optional[float]]:
-        """
-        Calculates current IC status based on elapsed real time.
-        Returns: (Day Name, HH:MM Time, minutes_into_current_day)
-        """
-        if self.cal_real_dt is None or self.cal_ic_total_min is None:
-            return None, None, None
-        
-        delta_real_seconds = (datetime.now() - self.cal_real_dt).total_seconds()
-        delta_ic_minutes = delta_real_seconds / self.time_speed
-        
-        current_total_min = self.cal_ic_total_min + delta_ic_minutes
-        
-        # Calculate Day and Time
-        total_days = int(current_total_min // IC_MIN_PER_DAY)
-        current_day_idx = total_days % 7
-        
-        minutes_into_day = current_total_min % IC_MIN_PER_DAY
-        
-        return DAYS_OF_WEEK[current_day_idx], min_to_time(minutes_into_day), minutes_into_day
+    def get_status(
+        self, target_dt: Optional[datetime] = None
+    ) -> Optional[Tuple[str, str, float, float]]:
+        if not self.cal_real_dt or self.cal_ic_total_min is None:
+            return None
 
-    def get_ic_time_at(self, real_time_str: str) -> Tuple[Optional[str], Optional[str], Optional[float]]:
-        """
-        Calculates predicted IC time for a specific real-world HH:MM today.
-        Returns: (Day Name, HH:MM Time, minutes_into_current_day)
-        """
-        if self.cal_real_dt is None or self.cal_ic_total_min is None:
-            return None, None, None
-            
-        now = datetime.now()
-        h_m = time_to_min(real_time_str)
-        if h_m is None:
-            return None, None, None
-            
-        h, m = h_m // 60, h_m % 60
-        target_real_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-            
-        delta_real_seconds = (target_real_dt - self.cal_real_dt).total_seconds()
-        delta_ic_minutes = delta_real_seconds / self.time_speed
-        
-        current_total_min = self.cal_ic_total_min + delta_ic_minutes
-        
-        total_days = int(current_total_min // IC_MIN_PER_DAY)
-        current_day_idx = total_days % 7
-        minutes_into_day = current_total_min % IC_MIN_PER_DAY
+        now_dt = target_dt or datetime.now()
+        delta_sec = (now_dt - self.cal_real_dt).total_seconds()
 
-        return DAYS_OF_WEEK[current_day_idx], min_to_time(minutes_into_day), minutes_into_day
+        # If target is in the past, project forward by whole days until future
+        if delta_sec < 0:
+            days_ahead = int(abs(delta_sec) / 86400) + 1
+            now_dt = now_dt + timedelta(days=days_ahead)
+            delta_sec = (now_dt - self.cal_real_dt).total_seconds()
 
-    def print_board(self, custom_ic_day: Optional[str] = None, custom_ic_min: Optional[float] = None):
-        """Displays the dashboard with current IC time and period countdowns."""
-        ic_day, ic_str, ic_min = self.get_estimated_ic_now()
-        
-        # Override for prediction display
-        if custom_ic_min is not None and custom_ic_day is not None:
-            ic_min = custom_ic_min
-            ic_day = custom_ic_day
-            ic_str = min_to_time(ic_min)
+        # Iteratively resolve speed/day until stable (max 2 flips: weekday<->weekend)
+        active_speed = self.current_speed
+        total_ic_min = self.cal_ic_total_min + (delta_sec / active_speed)
+        day_idx = int(total_ic_min // IC_MIN_PER_DAY) % 7
+        for _ in range(2):
+            new_speed = SPEED_WEEKEND if day_idx >= 5 else SPEED_STANDARD
+            if new_speed == active_speed:
+                break
+            active_speed = new_speed
+            total_ic_min = self.cal_ic_total_min + (delta_sec / active_speed)
+            day_idx = int(total_ic_min // IC_MIN_PER_DAY) % 7
 
-        if ic_day is None or ic_str is None:
-            print("\n[!] No calibration data available.")
+        day_name = DAYS_OF_WEEK[day_idx]
+        min_in_day = total_ic_min % IC_MIN_PER_DAY
+
+        h, m = int(min_in_day // 60), int(min_in_day % 60)
+        return day_name, f"{h:02d}:{m:02d}", min_in_day, active_speed
+
+    def check_alerts(self, day: str, ic_min: float):
+        if day in ("Saturday", "Sunday"):
             return
+        # Reset alerts when the IC day changes
+        if self.last_alert_day != day:
+            self.played_alerts.clear()
+            self.last_alert_day = day
+        for period, p_time in SCHOOL_SCHEDULE.items():
+            p_m = int(p_time.split(":")[0]) * 60 + int(p_time.split(":")[1])
+            diff = p_m - ic_min
+            if (
+                diff > ALERT_EPSILON
+                and diff <= ALERT_LEAD_IC + ALERT_EPSILON
+                and period not in self.played_alerts
+            ):
+                play_beep()
+                self.played_alerts.add(period)
 
-        print("\n" + "="*50)
-        # Centered Time Display
-        time_display = f"{ic_day} {ic_str}"
-        print(f" {time_display} ".center(50, "="))
-        print(f" Speed: {self.time_speed}s/IC min (1:{60/self.time_speed:.1f}) ".center(50))
-        print("="*50)
-        
-        if self.cal_real_dt:
-            sync_time = self.cal_real_dt.strftime('%H:%M:%S')
-            print(f" (Last Sync: {sync_time} OOC) ".center(50))
-            print("-" * 50)
-        
-        print(f"{'PERIOD':<20} | {'TIME':<6} | {'REMAINING'}")
-        print("-" * 50)
-        
-        # Detect Weekend
-        is_weekend = ic_day in ["Saturday", "Sunday"]
-        if is_weekend:
-             print(f"{'WEEKEND - NO SCHOOL':^50}")
+    def print_dashboard(self):
+        os.system("cls" if os.name == "nt" else "clear")
+        result = self.get_status()
+        if result is None:
+            print("\n[!] SYSTEM OFFLINE: Please Sync (Option 1) to anchor the time.")
+            return
+        day, time_str, ic_min, speed = result
+
+        self.check_alerts(day, ic_min)
+        print(f"\n{'=' * 40}\n {day} {time_str} | Speed: {int(speed)}s\n{'=' * 40}")
+
+        if day in ("Saturday", "Sunday"):
+            print(f"{'WEEKEND - NO SCHOOL':^40}")
         else:
-            sorted_schedule = sorted(SCHOOL_SCHEDULE.items(), key=lambda x: time_to_min(x[1]) or 0)
+            for p, pt in sorted(SCHOOL_SCHEDULE.items(), key=lambda x: x[1]):
+                p_m = int(pt.split(":")[0]) * 60 + int(pt.split(":")[1])
+                diff = p_m - ic_min
+                status = (
+                    "PASSED"
+                    if diff < 0
+                    else "NOW"
+                    if diff < 1
+                    else f"{int(diff * speed)}s"
+                )
+                print(f"{p:<15} | {pt} | {status}")
+        print("=" * 40)
 
-            for period, ic_time_str in sorted_schedule:
-                period_min = time_to_min(ic_time_str)
-                if period_min is None: continue
-                
-                # Calculate wait time within the day
-                ic_wait = period_min - ic_min
-                
-                if ic_wait < 0:
-                     # Period passed for today
-                     countdown = "PASSED"
-                elif ic_wait < 1:
-                     countdown = "NOW"
+    def configure_speed(self):
+        """Allow user to change the active speed."""
+        print("\n--- Speed Configuration ---")
+        print(f"1: Standard ({int(SPEED_STANDARD)}s per IC min)")
+        print(f"2: Weekend ({int(SPEED_WEEKEND)}s per IC min)")
+        print("3: Custom")
+        print("4: Cancel")
+        choice = input(">> ").strip()
+        if choice == "1":
+            self.current_speed = SPEED_STANDARD
+            print(f"Speed set to Standard ({int(self.current_speed)}s/min).")
+        elif choice == "2":
+            self.current_speed = SPEED_WEEKEND
+            print(f"Speed set to Weekend ({int(self.current_speed)}s/min).")
+        elif choice == "3":
+            try:
+                val = float(input("Enter seconds per IC minute: "))
+                if val > 0:
+                    self.current_speed = val
+                    print(f"Custom speed set to {val}s/min.")
                 else:
-                    real_wait_total_sec = ic_wait * self.time_speed
-                    h = int(real_wait_total_sec // 3600)
-                    m = int((real_wait_total_sec % 3600) // 60)
-                    s = int(real_wait_total_sec % 60)
-                    countdown = f"{h}h {m}m {s}s"
-                    
-                print(f"{period:<20} | {ic_time_str:<6} | {countdown}")
-                
-        print("="*50)
+                    print("Speed must be positive.")
+            except ValueError:
+                print("Invalid number.")
+        else:
+            print("Cancelled.")
+        time.sleep(1)
+
 
 def main():
     board = SchoolRPTimeBoard()
-    
     while True:
-        try:
-            clear_screen()
-            print("\n--- SchoolRP OOC Time Dashboard (Day Supported) ---")
-            
-            if board.cal_real_dt:
-                board.print_board()
+        board.print_dashboard()
+        print("\n1: SYNC | 2: PREDICT | 3: REFRESH | 4: CONFIG | Q: QUIT")
+        choice = input(">> ").lower().strip()
+        if choice == "1":
+            d_str = input("Day (Mon/Sat/etc): ").strip()
+            d_idx = match_day(d_str)
+            t_str = input("Time (HH:MM): ").strip()
+            if d_idx is not None and board.save_calibration(t_str, d_idx):
+                print("Synced!")
             else:
-                print("\n[!] Dashboard Offline: No Calibration Data.")
-                print("Please perform an IC Sync (Option 1) to start.")
-            
-            print("\n[Menu Options]")
-            print("1. [SYNC]    Update Day & Time")
-            print("2. [PREDICT] What time will it be at ...?")
-            print("3. [REFRESH] Update countdowns")
-            print(f"4. [CONFIG]  Change Time Speed (Current: {board.time_speed}s/min)")
-            print("q. [QUIT]    Close the dashboard")
-            
-            choice = input("\nSelect: ").strip().lower()
-            
-            if choice == '1':
-                print("\n--- SYNC WIZARD ---")
-                day_str = input("1. Current IC Day (e.g. Mon, Monday, 1): ")
-                day_idx = get_day_index(day_str)
-                
-                if day_idx is None:
-                     input("\n[!] Invalid Day. Returns to menu.\n")
-                     continue
-                     
-                ic_time = input(f"2. Current {DAYS_OF_WEEK[day_idx]} Time (HH:MM): ").strip()
-                
-                if board.save_calibration(ic_time, day_idx):
-                    input(f"\n[✓] Sync Successful! Set to {DAYS_OF_WEEK[day_idx]} {ic_time}.\nPress Enter to return.")
+                print("Invalid Input.")
+            time.sleep(1)
+        elif choice == "2":
+            t_ooc = input("Real Time (HH:MM): ").strip()
+            try:
+                h, m = map(int, t_ooc.split(":"))
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    print("Invalid time.")
+                    time.sleep(1)
+                    continue
+                target = datetime.now().replace(
+                    hour=h, minute=m, second=0, microsecond=0
+                )
+                res = board.get_status(target)
+                if res is not None:
+                    print(f"\nPrediction: {res[0]} {res[1]}")
                 else:
-                    input("\n[!] Error: Invalid Time format (HH:MM).\nPress Enter to try again.")
-                    
-            elif choice == '2':
-                ooc = input("\nEnter Target Real (OOC) Time (HH:MM): ").strip()
-                day, time, mins = board.get_ic_time_at(ooc)
-                if day:
-                    print(f"\n>>> At {ooc} OOC, it will be {day} {time} IC.")
-                    board.print_board(custom_ic_day=day, custom_ic_min=mins)
-                    input("\nPress Enter to return to live dashboard.")
-                else:
-                    input("\n[!] Error: Invalid format.\nPress Enter to return.")
-                    
-            elif choice == '3':
-                continue 
-
-            elif choice == '4':
-                print(f"\n--- Time Speed Configuration ---")
-                print(f"1. Standard ({SPEED_STANDARD}s/min) - Default")
-                print(f"2. Weekend ({SPEED_WEEKEND}s/min) - Fast")
-                print(f"3. Custom")
-                
-                c = input("\nSelect Speed: ").strip()
-                new_speed = None
-                
-                if c == '1':
-                    new_speed = SPEED_STANDARD
-                elif c == '2':
-                    new_speed = SPEED_WEEKEND
-                elif c == '3':
-                    try:
-                        s = float(input("Enter seconds per IC minute (e.g. 15.0): "))
-                        if s > 0:
-                            new_speed = s
-                        else:
-                            print("Speed must be positive.")
-                    except ValueError:
-                        print("Invalid number.")
-                
-                if new_speed:
-                    board.time_speed = new_speed
-                    board.save_calibration() # Save just the config
-                    input(f"\n[✓] Speed updated to {new_speed}s/min.\nPress Enter to return.")
-                else:
-                    input("\n[!] Cancelled or Invalid.\nPress Enter to return.")
-                    
-            elif choice == 'q':
-                print("\nExiting")
-                break
-        except KeyboardInterrupt:
-            print("\nExiting")
+                    print("\n[!] No calibration data. Sync first.")
+                input("Press Enter...")
+            except (ValueError, OSError):
+                print("Invalid format.")
+                time.sleep(1)
+        elif choice == "3":
+            # REFRESH: immediately re-render dashboard
+            continue
+        elif choice == "4":
+            board.configure_speed()
+        elif choice == "q":
             break
+        else:
+            time.sleep(0.5)
+
 
 if __name__ == "__main__":
     main()
-
